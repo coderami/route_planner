@@ -112,13 +112,33 @@ def solve(D, n_nodes, has_end, loop):
     return order
 
 
-def maps_url(route: list[Stop]) -> str:
+def maps_urls(route: list[Stop], per_link: int = 11) -> list[dict]:
+    """Google Maps takes ~9 waypoints per link, so long routes are split in parts."""
     pt = lambda s: f"{s.lat},{s.lng}"
-    url = (f"https://www.google.com/maps/dir/?api=1&travelmode=driving"
-           f"&origin={pt(route[0])}&destination={pt(route[-1])}")
-    if len(route) > 2:
-        url += "&waypoints=" + quote("|".join(pt(s) for s in route[1:-1]), safe=",|")
-    return url  # Google Maps handles ~9 waypoints per link
+    links, i = [], 0
+    while i < len(route) - 1:
+        seg = route[i:i + per_link]
+        url = ("https://www.google.com/maps/dir/?api=1&travelmode=driving"
+               f"&origin={pt(seg[0])}&destination={pt(seg[-1])}")
+        if len(seg) > 2:
+            url += "&waypoints=" + quote("|".join(pt(s) for s in seg[1:-1]), safe=",|")
+        links.append({"label": f"Part {len(links) + 1}: stops {i + 1}-{i + len(seg)}", "url": url})
+        i += per_link - 1
+    return links
+
+
+async def get_geometry(client, route: list[Stop]):
+    """Road-following line for the map (falls back to straight lines)."""
+    coords = ";".join(f"{s.lng},{s.lat}" for s in route)
+    try:
+        r = await client.get(f"{OSRM}/route/v1/driving/{coords}",
+                             params={"overview": "full", "geometries": "geojson"}, headers=UA)
+        j = r.json()
+        if j.get("code") == "Ok":
+            return [[y, x] for x, y in j["routes"][0]["geometry"]["coordinates"]]
+    except Exception:
+        pass
+    return [[s.lat, s.lng] for s in route]
 
 
 @app.post("/optimize", dependencies=[Depends(check_key)])
@@ -144,12 +164,15 @@ async def optimize(req: RouteRequest):
              "duration_min": round(T[a][b] / 60, 1), "distance_km": round(Dist[a][b] / 1000, 2)}
             for a, b in zip(order, order[1:])]
     route = [nodes[i] for i in order]
+    async with httpx.AsyncClient(timeout=30) as c2:
+        geometry = await get_geometry(c2, route)
     return {
         "ordered_stops": [s.model_dump() for s in route],
         "legs": legs,
         "total_duration_min": round(sum(l["duration_min"] for l in legs), 1),
         "total_distance_km": round(sum(l["distance_km"] for l in legs), 2),
-        "google_maps_url": maps_url(route),
+        "navigation_links": maps_urls(route),
+        "geometry": geometry,
     }
 
 
@@ -161,7 +184,7 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 :root{--bg:#f6f7f9;--card:#fff;--tx:#1b1d21;--mut:#6b7280;--pr:#0b57d0;--on:#fff;--bd:#e3e6ea}
 @media(prefers-color-scheme:dark){:root{--bg:#111316;--card:#1b1e23;--tx:#eceef1;--mut:#9aa1ab;--pr:#7aa7ff;--on:#0b1220;--bd:#2c3036}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.4 system-ui,sans-serif;padding:max(16px,env(safe-area-inset-top)) 16px max(24px,env(safe-area-inset-bottom))}
-main{max-width:560px;margin:auto}h1{font-size:22px;margin:4px 0 14px}
+main{max-width:1200px;margin:auto}.wrap{display:grid;gap:12px}#map{height:340px;border-radius:14px;border:1px solid var(--bd);display:none}.pin{width:26px;height:26px;background:var(--pr);color:var(--on);border-radius:50%;text-align:center;font:600 13px/22px system-ui;border:2px solid var(--on)}@media(min-width:900px){.wrap{grid-template-columns:420px 1fr;align-items:start}#map{height:calc(100vh - 90px);position:sticky;top:16px}}h1{font-size:22px;margin:4px 0 14px}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:14px;margin-bottom:12px}
 label{display:block;font-size:13px;color:var(--mut);margin:0 0 6px}
 input[type=text],textarea{width:100%;padding:12px;font:inherit;color:var(--tx);background:var(--bg);border:1px solid var(--bd);border-radius:10px;margin-bottom:12px}
@@ -173,9 +196,9 @@ button.sec{background:var(--bg);color:var(--tx);border:1px solid var(--bd);width
 ol{padding-left:0;list-style:none;margin:0 0 14px}li{display:flex;gap:10px;padding:10px 0;border-bottom:1px solid var(--bd)}
 .n{flex:none;width:26px;height:26px;border-radius:50%;background:var(--pr);color:var(--on);text-align:center;font:600 14px/26px system-ui}
 .mut{color:var(--mut);font-size:13px}#msg{color:#d93025;margin:8px 0}
-</style></head><body><main>
+</style><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css"></head><body><main>
 <h1>Route Planner</h1>
-<div class="card">
+<div class="wrap"><div><div class="card">
 <label for="start">Start</label>
 <div class="row"><input id="start" type="text" placeholder="Address or use my location"><button class="sec" id="loc" type="button">Use GPS</button></div>
 <label for="stops">Stops (one per line)</label>
@@ -185,8 +208,9 @@ ol{padding-left:0;list-style:none;margin:0 0 14px}li{display:flex;gap:10px;paddi
 <div class="chk"><input id="loop" type="checkbox"><label for="loop" style="margin:0">Return to start</label></div>
 <button id="go" type="button">Plan best route</button><div id="msg"></div>
 </div>
-<div id="out"></div>
+<div id="out"></div></div><div id="map"></div></div>
 </main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <script>
 const $=id=>document.getElementById(id);let me=null;
 function msg(t){$('msg').textContent=t||''}
@@ -198,6 +222,17 @@ async function call(body){
   if(r.status===401){key=prompt('API key')||'';try{localStorage.setItem('rk',key)}catch(e){}
     r=await fetch('/optimize',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':key},body:JSON.stringify(body)})}
   const j=await r.json();if(!r.ok)throw new Error(j.detail||'Request failed');return j}
+let map,layer;
+function drawMap(j){
+  const m=$('map');m.style.display='block';
+  if(!map){map=L.map('map');L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map)}
+  if(layer)layer.remove();layer=L.layerGroup().addTo(map);
+  const line=L.polyline(j.geometry,{weight:5,color:'#0b57d0'}).addTo(layer);
+  j.ordered_stops.forEach((s,i)=>{const p=document.createElement('div');p.textContent=s.name||s.address||'';
+    L.marker([s.lat,s.lng],{icon:L.divIcon({className:'',html:'<div class="pin">'+(i+1)+'</div>',iconSize:[26,26],iconAnchor:[13,13]})}).bindPopup(p).addTo(layer)});
+  map.invalidateSize();map.fitBounds(line.getBounds(),{padding:[30,30]});
+  if(innerWidth<900)m.scrollIntoView({behavior:'smooth'});
+}
 $('go').onclick=async()=>{
   msg('');const lines=$('stops').value.split('\n').map(s=>s.trim()).filter(Boolean);
   const st=$('start').value.trim();
@@ -219,8 +254,9 @@ $('go').onclick=async()=>{
         m.textContent='next: '+j.legs[i].duration_min+' min, '+j.legs[i].distance_km+' km';d.appendChild(m)}
       li.append(n,d);ol.appendChild(li)});
     c.appendChild(ol);
-    const a=document.createElement('a');a.className='btn';a.href=j.google_maps_url;a.target='_blank';a.rel='noopener';
-    a.textContent='Start navigation';c.appendChild(a);out.appendChild(c);
+    const nl=j.navigation_links;nl.forEach(l=>{const a=document.createElement('a');a.className='btn';a.style.marginTop='8px';a.href=l.url;a.target='_blank';a.rel='noopener';
+      a.textContent=nl.length>1?'Navigate - '+l.label:'Start navigation';c.appendChild(a)});
+    out.appendChild(c);drawMap(j);
   }catch(err){msg(err.message)}
   $('go').disabled=false;$('go').textContent='Plan best route';
 };
